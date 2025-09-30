@@ -1,208 +1,113 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
-from motor.motor_asyncio import AsyncIOMotorClient
-from stellar_sdk import Keypair, Server, Asset
-from stellar_sdk.exceptions import NotFoundError, ConnectionError as StellarConnectionError
-from pathlib import Path
-from pydantic import BaseModel, Field, validator
-from typing import List, Optional, Dict, Any
-from datetime import datetime
+from pydantic import BaseModel
+from stellar_sdk import Server, Keypair, Asset
+from pymongo import MongoClient
 import os
-import uuid
-import logging
 
-# Load .env if present
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / ".env")
+# Load environment variables (example: in Render Dashboard)
+MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://mercerbear_db_user:G1HAosnfSOG4ZhWo@wlx.5ytqctl.mongodb.net/?retryWrites=true&w=majority")
+ASSET_CODE = os.getenv("ASSET_CODE", "WLX")
+ASSET_ISSUER = os.getenv("ASSET_ISSUER", "GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")  # replace with valid Stellar public key
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
+# MongoDB client
+client = MongoClient(MONGO_URI)
+db = client["wlx_db"]
+transactions_collection = db["transactions"]
 
-# Read environment variables
-MONGO_URL = os.environ.get("MONGO_URL")
-DB_NAME = os.environ.get("DB_NAME", "wlx")
-CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*").split(",")
-STELLAR_HORIZON_URL = os.environ.get("STELLAR_RPC_URL", "https://horizon.stellar.org")
-NETWORK_PASSPHRASE = os.environ.get("NETWORK_PASSPHRASE", "Public Global Stellar Network ; September 2015")
-ASSET_CODE = os.environ.get("ASSET_CODE", "WLX")
-ASSET_ISSUER = os.environ.get("ASSET_ISSUER")
-
-# Validate ASSET_ISSUER
-if not ASSET_ISSUER or not ASSET_ISSUER.startswith("G"):
-    raise ValueError("ASSET_ISSUER must be a valid Stellar public key (G...)")
-
-logger.info(f"ASSET_ISSUER: {ASSET_ISSUER}")
-
-# MongoDB setup
-client = AsyncIOMotorClient(MONGO_URL)
-db = client[DB_NAME]
+# Stellar server
+HORIZON_URL = "https://horizon.stellar.org"
+stellar_server = Server(horizon_url=HORIZON_URL)
 
 # FastAPI app
-app = FastAPI(title="WhiplashXLM Bot API", version="1.0.0")
-api_router = APIRouter(prefix="/api")
+app = FastAPI()
 
-# Pydantic models
-class StatusCheck(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
-
-class StatusCheckCreate(BaseModel):
-    client_name: str
-
-class WalletBalanceRequest(BaseModel):
-    public_key: str = Field(..., description="Stellar account public key")
-    
-    @validator("public_key")
-    def validate_public_key(cls, v):
-        try:
-            Keypair.from_public_key(v)
-            return v
-        except Exception:
-            raise ValueError("Invalid Stellar public key format")
-
-class AssetBalance(BaseModel):
-    asset_code: str
-    asset_issuer: Optional[str] = None
-    balance: str
-    asset_type: str
-    limit: Optional[str] = None
-
-class WalletBalanceResponse(BaseModel):
-    account_id: str
-    native_balance: str
-    wlx_balance: Optional[str] = None
-    has_wlx: bool = False
-    all_balances: List[AssetBalance]
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
-
-class ErrorResponse(BaseModel):
-    error: str
-    detail: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
-
-# Stellar service
-class StellarService:
-    def __init__(self):
-        self.server = Server(STELLAR_HORIZON_URL)
-        self.wlx_asset = Asset(ASSET_CODE, ASSET_ISSUER)
-        logger.info(f"Initialized Stellar service with {STELLAR_HORIZON_URL}")
-
-    async def get_account_balances(self, public_key: str) -> WalletBalanceResponse:
-        try:
-            logger.info(f"Fetching balances for account: {public_key}")
-            account_response = self.server.accounts().account_id(public_key).call()
-
-            all_balances = []
-            native_balance = "0"
-            wlx_balance = None
-            has_wlx = False
-
-            for balance in account_response["balances"]:
-                asset_balance = AssetBalance(
-                    asset_code=balance.get("asset_code", "XLM"),
-                    asset_issuer=balance.get("asset_issuer"),
-                    balance=balance["balance"],
-                    asset_type=balance["asset_type"],
-                    limit=balance.get("limit")
-                )
-                all_balances.append(asset_balance)
-
-                if balance["asset_type"] == "native":
-                    native_balance = balance["balance"]
-
-                if balance.get("asset_code") == ASSET_CODE and balance.get("asset_issuer") == ASSET_ISSUER:
-                    wlx_balance = balance["balance"]
-                    has_wlx = True
-                    logger.info(f"Found WLX balance: {wlx_balance}")
-
-            return WalletBalanceResponse(
-                account_id=account_response["account_id"],
-                native_balance=native_balance,
-                wlx_balance=wlx_balance,
-                has_wlx=has_wlx,
-                all_balances=all_balances
-            )
-
-        except NotFoundError:
-            raise HTTPException(status_code=404, detail=f"Account {public_key} not found")
-        except StellarConnectionError:
-            raise HTTPException(status_code=503, detail="Unable to connect to Stellar network")
-        except Exception as e:
-            logger.error(f"Unexpected error: {str(e)}")
-            raise HTTPException(status_code=500, detail="Internal server error")
-
-stellar_service = StellarService()
-def get_stellar_service() -> StellarService:
-    return stellar_service
-
-# API routes
-@api_router.get("/")
-async def root():
-    return {"message": "WhiplashXLM Bot API - Ready to track WLX assets!"}
-
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_obj = StatusCheck(**input.dict())
-    await db.status_checks.insert_one(status_obj.dict())
-    return status_obj
-
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    status_checks = await db.status_checks.find().to_list(1000)
-    return [StatusCheck(**s) for s in status_checks]
-
-@api_router.post("/wallet/balance", response_model=WalletBalanceResponse)
-async def get_wallet_balance(request: WalletBalanceRequest, stellar_service: StellarService = Depends(get_stellar_service)):
-    return await stellar_service.get_account_balances(request.public_key)
-
-@api_router.get("/wallet/{public_key}/wlx")
-async def get_wlx_balance(public_key: str, stellar_service: StellarService = Depends(get_stellar_service)):
-    try:
-        Keypair.from_public_key(public_key)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid Stellar public key format")
-    balance_data = await stellar_service.get_account_balances(public_key)
-    return {
-        "account_id": public_key,
-        "wlx_balance": balance_data.wlx_balance,
-        "has_wlx": balance_data.has_wlx,
-        "native_balance": balance_data.native_balance,
-        "timestamp": datetime.utcnow()
-    }
-
-@api_router.get("/health")
-async def health_check():
-    return {
-        "status": "healthy",
-        "timestamp": datetime.utcnow(),
-        "service": "whiplash-xlm-bot-api",
-        "stellar_network": "mainnet"
-    }
-
-# Include router
-app.include_router(api_router)
-
-# CORS
+# Enable CORS for your frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
+    allow_origins=["https://wlxdao.com"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.exception_handler(Exception)
-async def global_exception_handler(request, exc):
-    logger.error(f"Global exception caught: {exc}")
-    return ErrorResponse(error="Internal Server Error", detail=str(exc))
+# Pydantic models
+class WalletRequest(BaseModel):
+    public_key: str
 
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
+class TransactionRequest(BaseModel):
+    public_key: str
+    amount: float
 
+# Initialize Stellar asset
+try:
+    wlx_asset = Asset(ASSET_CODE, ASSET_ISSUER)
+except Exception:
+    raise ValueError("ASSET_ISSUER must be a valid Stellar public key (G...)")
+
+# Helper: calculate daily return by tier
+def calculate_daily_return(balance):
+    balance = float(balance)
+    if 200 <= balance <= 598:
+        return "0.274–0.819 XLM"
+    elif 600 <= balance <= 1998:
+        return "0.822–2.739 XLM"
+    elif 2000 <= balance <= 5998:
+        return "2.740–8.217 XLM"
+    elif 6000 <= balance <= 19998:
+        return "8.219–27.397 XLM"
+    elif 20000 <= balance <= 49998:
+        return "27.397–68.475 XLM"
+    elif 50000 <= balance <= 99998:
+        return "68.475–136.986 XLM"
+    elif 100000 <= balance <= 200000:
+        return "137–274 XLM"
+    elif 240000 <= balance <= 400000:
+        return "329–548 XLM"
+    elif balance > 400000:
+        return "548+ XLM"
+    else:
+        return "Contact Support"
+
+# Endpoint: check balance
+@app.post("/api/wallet/balance")
+async def get_balance(wallet: WalletRequest):
+    public_key = wallet.public_key
+    if not public_key.startswith("G") or len(public_key) != 56:
+        raise HTTPException(status_code=400, detail="Invalid Stellar public key.")
+
+    try:
+        account = stellar_server.accounts().account_id(public_key).call()
+        balances = {b['asset_type']: b['balance'] for b in account['balances']}
+        # native = XLM
+        native_balance = balances.get("native", "0")
+        return {"balance": native_balance}
+    except Exception:
+        raise HTTPException(status_code=400, detail="Account not found or error fetching balance.")
+
+# Endpoint: get tier and daily return
+@app.post("/api/wallet/tier")
+async def get_tier(wallet: WalletRequest):
+    try:
+        account = stellar_server.accounts().account_id(wallet.public_key).call()
+        balances = {b['asset_code'] if 'asset_code' in b else b['asset_type']: b['balance'] for b in account['balances']}
+        wlx_balance = float(balances.get(ASSET_CODE, 0))
+        daily_return = calculate_daily_return(wlx_balance)
+        return {"wlx_balance": wlx_balance, "daily_return": daily_return}
+    except Exception:
+        raise HTTPException(status_code=400, detail="Error fetching tier info.")
+
+# Endpoint: record a transaction (example: deposit)
+@app.post("/api/transactions")
+async def record_transaction(tx: TransactionRequest):
+    transaction = {
+        "public_key": tx.public_key,
+        "amount": tx.amount
+    }
+    transactions_collection.insert_one(transaction)
+    return {"status": "success", "transaction": transaction}
+
+# Health check
+@app.get("/api/health")
+async def health_check():
+    return {"status": "ok"}
